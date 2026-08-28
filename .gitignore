@@ -1,0 +1,41 @@
+# ---- CMake ----
+/build/
+/out/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+compile_commands.json
+CMakeUserPresets.json
+
+# ---- Visual Studio ----
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.sdf
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# ---- Build output / binaries ----
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.map
+*.idb
+
+# ---- Misc editor / OS files ----
+*.user
+*~
+.DS_Store
+Thumbs.db
