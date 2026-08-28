@@ -23,27 +23,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include <ctype.h>
 #include "slcan.h"
 
 #define DEFAULT_CHANNEL      "can0"
 #define PIPE_RX_FORMAT       "\\\\.\\pipe\\serial_rx\\%s"
 
-/* Channel name is embedded verbatim in the named pipe path, so keep it
- * restricted to a safe charset (no backslashes / control chars) and
- * non-empty. */
-static int is_valid_channel(const char *s)
-{
-    if (!s || *s == '\0') return 0;
-    for (const char *p = s; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (!(isalnum(c) || c == '_' || c == '-')) return 0;
-    }
-    return 1;
-}
-
 /* Format the current system time as "(seconds.microseconds)", e.g.
- * "(1735689600.123456)" - a candump-style Unix timestamp with
+ * "(1735689600.123456)"  -  a candump-style Unix timestamp with
  * microsecond resolution. 116444736000000000ULL is the number of
  * 100ns FILETIME ticks between the Windows epoch (1601-01-01) and
  * the Unix epoch (1970-01-01), used to convert FILETIME to Unix
@@ -62,9 +48,9 @@ static void get_timestamp(char *buf, int buflen)
              (unsigned long long)(us % 1000000));
 }
 
-/* Print one received frame to stdout in candump-like text form (see
+/* Print one received frame to stdout in candump-like log form (see
  * the format table in the file header comment above). channel is the
- * CAN interface name to print in the second field - it must be the
+ * CAN interface name to print in the second field  -  it must be the
  * channel this reader actually connected to (passed down from main's
  * ch), not a hardcoded name, since a reader can be pointed at any
  * channel via its command-line argument. */
@@ -103,7 +89,7 @@ static void print_frame(const CanFrame *f, const char *channel)
 }
 
 /* Print --help text to stderr. prog is the name to show in the usage
- * line - pass argv[0], or a hardcoded fallback if unavailable. */
+ * line  -  pass argv[0], or a hardcoded fallback if unavailable. */
 static void print_usage(const char *prog)
 {
     char pipe_rx_ex[48];
@@ -118,7 +104,7 @@ static void print_usage(const char *prog)
         "\n"
         "Connects to the daemon's RX named pipe for that channel\n"
         "(e.g. %s), receives CanFrame records, and prints them to\n"
-        "stdout in candump log file format:\n"
+        "stdout in candump-like log form:\n"
         "\n"
         "  Classic:              (timestamp) can0 123#DEADBEEF\n"
         "  CAN FD (no BRS):      (timestamp) can0 123##DEADBEEF...\n"
@@ -157,7 +143,7 @@ int main(int argc, char *argv[])
 
 	const char *ch = DEFAULT_CHANNEL;
     if (argc >= 2) {
-        if (!is_valid_channel(argv[1])) {
+        if (!slcan_valid_channel(argv[1])) {
             fprintf(stderr,
                     "[reader] Error: invalid channel name '%s' "
                     "(use letters, digits, '_' or '-', non-empty)\n\n",

@@ -8,6 +8,12 @@
 
 #define CANFD_MAX_DLC       0x0F
 
+/* CAN ID range limits, see ISO 11898-1: 11-bit standard, 29-bit
+ * extended. Shared by slcan_encode()'s and slcan_parse_frame()'s
+ * range checks. */
+#define CAN_SFF_ID_MAX      0x7FFu
+#define CAN_EFF_ID_MAX      0x1FFFFFFFu
+
 /* id is only meaningful in the low 11 bits (ext=0) or low 29 bits
  * (ext=1); slcan_encode() rejects a frame whose id doesn't fit. */
 typedef struct {
@@ -78,6 +84,37 @@ int slcan_encode(const CanFrame *f, char *out, int maxlen);
  * Returns 0 on success. Returns -1 if line/out are NULL, the type
  * character is unrecognized, the header fields don't parse, or the
  * line is shorter than the data length its own DLC declares (a
- * truncated/corrupted line) - decoding never reads past the NUL
+ * truncated/corrupted line)  -  decoding never reads past the NUL
  * terminator of line. */
 int slcan_decode(const char *line, CanFrame *out);
+
+/* Check that s is safe to embed verbatim in a named pipe path: non-empty,
+ * and restricted to letters, digits, '_' and '-' (no backslashes or
+ * other control/path-special characters). Every slcan-utils CLI
+ * (slcd/slcr/slcw/slcplay) validates its channel argument with this
+ * before building \\.\pipe\serial_tx\<channel> / \\.\pipe\serial_rx\
+ * <channel>. Returns 1 if valid, 0 otherwise (including s == NULL). */
+int slcan_valid_channel(const char *s);
+
+/* Parse one candump/SLCAN-CLI style frame text line into a CanFrame:
+ *
+ *   123#DEADBEEF          Classic CAN, standard (11-bit) ID
+ *   00000123#DEADBEEF     Classic CAN, extended (29-bit) ID
+ *   123#R                 Classic CAN, RTR
+ *   123##DEADBEEF...      CAN FD, standard ID
+ *   123##*DEADBEEF...     CAN FD, standard ID, BRS
+ *   00000123##DEADBEEF    CAN FD, extended ID
+ *   00000123##*DEADBEEF   CAN FD, extended ID, BRS
+ *
+ * line must contain a '#' separating the hex CAN ID from the
+ * frame-type/data suffix; id and data digits are validated as hex (a
+ * typo like "12G#.." is rejected rather than silently truncated by
+ * strtoul()'s lenient parsing), and id must fit the 11-bit/29-bit
+ * range implied by its digit count (8 hex digits selects extended).
+ * Parsing stops at '\0', '\r', or '\n', so line need not be
+ * newline-terminated. Shared by serial_writer.c (one frame per stdin
+ * line) and slcan_player.c (the frame column of a replayed log line).
+ *
+ * Returns 0 on success, -1 on any parse error (f's contents are then
+ * unspecified - the caller should not use it). */
+int slcan_parse_frame(const char *line, CanFrame *f);

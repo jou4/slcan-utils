@@ -4,13 +4,12 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-/* CAN ID range limits, see ISO 11898-1: 11-bit standard, 29-bit
- * extended. Used to reject a CanFrame whose id doesn't actually fit
- * the frame's ext flag before we format it into a fixed-width hex
- * field ("%03X"/"%08X" don't truncate an oversized value, they just
- * widen the output, which would produce a malformed SLCAN line). */
-#define CAN_SFF_ID_MAX  0x7FFu
-#define CAN_EFF_ID_MAX  0x1FFFFFFFu
+/* CAN_SFF_ID_MAX / CAN_EFF_ID_MAX (11-bit / 29-bit range limits) are
+ * defined in slcan.h -- used below to reject a CanFrame whose id
+ * doesn't actually fit the frame's ext flag before we format it into
+ * a fixed-width hex field ("%03X"/"%08X" don't truncate an oversized
+ * value, they just widen the output, which would produce a malformed
+ * SLCAN line), and again in slcan_parse_frame()'s own range check. */
 
 /* -------------------------------------------------------
  * slcan_encode
@@ -93,7 +92,7 @@ int slcan_encode(const CanFrame *f, char *out, int maxlen)
 /* Decode one ASCII hex byte "XX" at p[0..1] into its numeric value.
  * Caller (slcan_decode) is responsible for guaranteeing p[0] and
  * p[1] are both valid hex digits within bounds first (see
- * hex_span_valid below) - this function does not itself validate
+ * hex_span_valid below)  -  this function does not itself validate
  * or report a parse failure, it just mirrors strtoul()'s lenient
  * "stop at the first non-hex char" behavior. */
 static uint8_t hex2byte(const char *p)
@@ -248,3 +247,80 @@ int slcan_decode(const char *line, CanFrame *out)
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
+
+/* Channel name is embedded verbatim in a named pipe path, so keep it
+ * restricted to a safe charset (no backslashes / control chars) and
+ * non-empty. Shared by every slcan-utils CLI; see slcan.h. */
+int slcan_valid_channel(const char *s)
+{
+    if (!s || *s == '\0') return 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '_' || c == '-')) return 0;
+    }
+    return 1;
+}
+
+/* See slcan.h for the full parameter/return-value contract. Shared by
+ * serial_writer.c (one frame per stdin line) and slcan_player.c (the
+ * frame column of a replayed log line). */
+int slcan_parse_frame(const char *line, CanFrame *f)
+{
+    memset(f, 0, sizeof(*f));
+
+    const char *hash = strchr(line, '#');
+    if (!hash) return -1;
+
+    /* ID */
+    char id_str[16] = {0};
+    size_t id_len = (size_t)(hash - line);
+    if (id_len == 0 || id_len >= sizeof(id_str)) return -1;
+    for (size_t i = 0; i < id_len; i++) {
+        if (!isxdigit((unsigned char)line[i])) return -1;
+    }
+    memcpy(id_str, line, id_len);
+    f->id = (uint32_t)strtoul(id_str, NULL, 16);
+
+    /* ID of Extended Frame */
+    f->ext = (id_len == 8) ? 1 : 0;
+
+    if (f->id > (f->ext ? CAN_EFF_ID_MAX : CAN_SFF_ID_MAX)) return -1;
+
+    /* Frame Type */
+    const char *payload = hash + 1;
+
+    if (*payload == '#') {
+        f->fd  = 1;
+        f->rtr = 0;
+        payload++;
+        if (*payload == '*') {
+            /* BRS */
+            f->brs = 1;
+            payload++;
+        }
+    } else if (*payload == 'R' || *payload == 'r') {
+        /* RTR */
+        f->rtr = 1;
+        f->fd  = 0;
+        f->len = 0;
+        f->dlc = 0;
+        return 0;
+    }
+
+    /* Data */
+    uint8_t maxlen = f->fd ? SLCAN_FD_MAX_DLEN : SLCAN_MAX_DLEN;
+    while (*payload && *payload != '\r' && *payload != '\n'
+           && f->len < maxlen) {
+        if (*(payload + 1) == '\0' ||
+            *(payload + 1) == '\r' ||
+            *(payload + 1) == '\n') break;
+        if (!isxdigit((unsigned char)payload[0]) ||
+            !isxdigit((unsigned char)payload[1])) return -1;
+        char hex[3] = { payload[0], payload[1], '\0' };
+        f->data[f->len++] = (uint8_t)strtoul(hex, NULL, 16);
+        payload += 2;
+    }
+
+    f->dlc = canfd_len2dlc(f->len);
+    return 0;
+}

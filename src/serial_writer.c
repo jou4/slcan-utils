@@ -25,108 +25,18 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <ctype.h>
 #include "slcan.h"
 
 #define DEFAULT_CHANNEL      "can0"
 #define PIPE_TX_FORMAT       "\\\\.\\pipe\\serial_tx\\%s"
 
-/* Channel name is embedded verbatim in the named pipe path, so keep it
- * restricted to a safe charset (no backslashes / control chars) and
- * non-empty. */
-static int is_valid_channel(const char *s)
-{
-    if (!s || *s == '\0') return 0;
-    for (const char *p = s; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (!(isalnum(c) || c == '_' || c == '-')) return 0;
-    }
-    return 1;
-}
-
-/* CAN ID range limits (ISO 11898-1: 11-bit standard, 29-bit
- * extended) - kept in sync with slcan.c's own encode-side check.
- * Rejecting an out-of-range ID here, at parse time, gives immediate
- * feedback to whoever is typing/piping frames into this CLI; without
- * it the frame would still get caught later by slcan_encode() inside
- * the daemon, but that failure is logged to the *daemon's* console
- * ("[tx] encode error"), which this writer's user may never see. */
-#define CAN_SFF_ID_MAX  0x7FFu
-#define CAN_EFF_ID_MAX  0x1FFFFFFFu
-
-/* Parse one input line (see the format table in the file header
- * comment) into a CanFrame. line must contain a '#' separating the
- * hex CAN ID from the frame-type/data suffix; id and data digits are
- * validated as hex (a typo like "12G#.." is rejected rather than
- * silently truncated by strtoul()'s lenient parsing), and the id
- * must fit the 11-bit/29-bit range implied by its digit count.
- * Returns 0 on success, -1 on any parse error (f's contents are
- * then unspecified - the caller should not use it). */
-static int parse_frame(const char *line, CanFrame *f)
-{
-    memset(f, 0, sizeof(*f));
-
-    const char *hash = strchr(line, '#');
-    if (!hash) return -1;
-
-	// ID
-    char id_str[16] = {0};
-    size_t id_len = (size_t)(hash - line);
-    if (id_len == 0 || id_len >= sizeof(id_str)) return -1;
-    for (size_t i = 0; i < id_len; i++) {
-        if (!isxdigit((unsigned char)line[i])) return -1;
-    }
-    memcpy(id_str, line, id_len);
-    f->id = (uint32_t)strtoul(id_str, NULL, 16);
-
-	// ID of Extended Frame
-    f->ext = (id_len == 8) ? 1 : 0;
-
-    if (f->id > (f->ext ? CAN_EFF_ID_MAX : CAN_SFF_ID_MAX)) return -1;
-
-	// Frame Type
-    const char *payload = hash + 1;
-
-    if (*payload == '#') {
-        f->fd  = 1;
-        f->rtr = 0;
-        payload++;
-        if (*payload == '*') {
-			// BRS
-            f->brs = 1;
-            payload++;
-        }
-    } else if (*payload == 'R' || *payload == 'r') {
-		// RTR
-        f->rtr = 1;
-        f->fd  = 0;
-        f->len = 0;
-        f->dlc = 0;
-        return 0;
-    }
-
-	// Data
-    uint8_t maxlen = f->fd ? SLCAN_FD_MAX_DLEN : SLCAN_MAX_DLEN;
-    while (*payload && *payload != '\r' && *payload != '\n'
-           && f->len < maxlen) {
-        if (*(payload + 1) == '\0' ||
-            *(payload + 1) == '\r' ||
-            *(payload + 1) == '\n') break;
-        if (!isxdigit((unsigned char)payload[0]) ||
-            !isxdigit((unsigned char)payload[1])) return -1;
-        char hex[3] = { payload[0], payload[1], '\0' };
-        f->data[f->len++] = (uint8_t)strtoul(hex, NULL, 16);
-        payload += 2;
-    }
-
-    f->dlc = canfd_len2dlc(f->len);
-    return 0;
-}
+/* is_valid_channel() and parse_frame() now live in slcan.c/slcan.h as
+ * slcan_valid_channel()/slcan_parse_frame(), shared with
+ * serial_reader.c and slcan_player.c. */
 
 /* Print --help text to stderr. prog is the name to show in the usage
- * line - pass argv[0], or a hardcoded fallback if unavailable. */
+ * line  -  pass argv[0], or a hardcoded fallback if unavailable. */
 static void print_usage(const char *prog)
 {
     char pipe_tx_ex[48];
@@ -170,7 +80,7 @@ static void print_usage(const char *prog)
  * the daemon to be listening), then read frame lines from stdin
  * until EOF, parsing and forwarding each one via the pipe. A parse
  * error is logged and that line is skipped (the connection stays
- * up); a pipe write error is fatal (the loop stops - the daemon side
+ * up); a pipe write error is fatal (the loop stops  -  the daemon side
  * of the connection is presumed gone). */
 int main(int argc, char *argv[])
 {
@@ -192,7 +102,7 @@ int main(int argc, char *argv[])
 
 	const char *ch = DEFAULT_CHANNEL;
     if (argc >= 2) {
-        if (!is_valid_channel(argv[1])) {
+        if (!slcan_valid_channel(argv[1])) {
             fprintf(stderr,
                     "[writer] Error: invalid channel name '%s' "
                     "(use letters, digits, '_' or '-', non-empty)\n\n",
@@ -233,7 +143,7 @@ int main(int argc, char *argv[])
         if (line[0] == '\n' || line[0] == '\r') continue;
         if (line[0] == '#'  || line[0] == ';')  continue;
 
-        if (parse_frame(line, &frame) != 0) {
+        if (slcan_parse_frame(line, &frame) != 0) {
             fprintf(stderr, "[writer] parse error: %s", line);
             continue;
         }
