@@ -10,6 +10,7 @@ Windows 用の SLCAN (Lawicel/CANable プロトコル) ユーティリティで�
 | `slcr.exe` (`serial_reader.c`) | デーモンの RX パイプに接続し、受信した CAN/CAN FD フレームを candump ライクなテキスト形式で標準出力に表示する CLI。 |
 | `slcw.exe` (`serial_writer.c`) | 標準入力からフレームのテキスト行を読み取り、デーモンの TX パイプ経由で送信する CLI。 |
 | `slcplay.exe` (`slcan_player.c`) | `slcr.exe` の出力形式のログファイルを、元のフレーム間隔を再現しながらデーモンの TX パイプへ再生する CLI。 |
+| `slcgw.exe` (`slcan_gateway.c`) | チャネルごとに割り当てた Lua スクリプトでゲートウェイルール (フィルタ/編集/転送先) を記述できる CAN ゲートウェイ。 |
 | `slcan` (`slcan.c` / `slcan.h`) | 上記の各 CLI が共有する SLCAN プロトコルのエンコード/デコード処理をまとめた静的ライブラリ。 |
 
 `channel` は複数の COM ポート/デーモンを同時に扱うための名前空間で、reader/writer 側は接続したいデーモンと同じ `channel` を指定する必要があります。
@@ -26,6 +27,8 @@ cmake --build build --config Release
 Visual Studio のプロジェクトファイルを生成した場合、`CMAKE_BUILD_TYPE` はビルド時の `--config` 指定 (または IDE のソリューション構成) で切り替わります。単一コンフィグ生成 (Ninja/Makefiles) の場合は `CMakeLists.txt` 側で `CMAKE_BUILD_TYPE` が未指定なら自動的に `Release` になります。
 
 ビルドされた実行ファイルは `build/` 配下に出力されます。
+
+`slcgw.exe` は Lua (5.5.1) を埋め込んでおり、`cmake -S . -B build` の実行時に CMake の `FetchContent` が `https://www.lua.org/ftp/lua-5.5.1.tar.gz` を自動的にダウンロードしてビルドします。追加のインストール作業は不要ですが、初回の `cmake` 実行時にこの URL へのネットワークアクセスが必要です。
 
 ## 使い方
 
@@ -101,6 +104,33 @@ slcplay.exe -h | --help
 - `-g <ms>`: 送信タイミングの再チェック間隔 (既定値: `1`ミリ秒)。フレーム間の間隔そのものではなく、スケジューラがどのくらいの頻度で「送信すべきフレームがないか」を確認するかを指定するものです。
 
 位置引数で `channel` を1つ以上指定すると、そのチャネルのフレームのみ再生します (省略時はログ内の全チャネルを再生)。
+
+### ゲートウェイ (gateway)
+
+```
+slcgw.exe <channel>=<script.lua> [<channel>=<script.lua> ...]
+slcgw.exe -h | --help
+```
+
+`channel=script.lua` の形式で、受信するチャネルとそれを処理する Lua スクリプトの組を1つ以上指定します。指定したチャネルごとに独立した Lua VM ・ワーカースレッドが立ち上がり、そのチャネルの RX パイプ (`\\.\pipe\serial_rx\<channel>`) から受信したフレームごとに、スクリプトの `gateway(src_channel, frame)` 関数が呼ばれます。
+
+```
+slcgw.exe can0=examples/gateway_example.lua can1=other.lua
+```
+
+スクリプト側が定義できる関数は次の3つです。
+
+- `initialize()`: チャネル開始時に一度だけ呼ばれます。`0` 以外を返す、またはエラーを起こすと、そのチャネルだけが無効化されます (他のチャネルには影響しません)。
+- `gateway(src_channel, frame)`: フレーム受信のたびに呼ばれます。`frame` は `id`/`ext`/`rtr`/`fd`/`brs`/`esi`/`dlc`/`len`/`data` (1始まりの配列) を持つテーブルで、フィールドを直接書き換えることでフレームを編集できます (`dlc` は `len` から自動的に再計算されるため、書き換えても反映されません)。戻り値で転送先を決めます。
+  - `nil` / `false`: ドロップ
+  - `"channel名"`: (編集後の) フレームをそのチャネル1つへ転送
+  - `{ "ch1", "ch2", ... }`: 同じ編集後フレームを複数チャネルへファンアウト
+  - `{ {channel="ch1", frame=f1}, "ch2", ... }`: チャネル名の文字列と `{channel=, frame=}` テーブルを混在させられます。後者を使うと、宛先ごとに異なる内容のフレームを送ったり、同じチャネルへ複数回(別内容で)送ったりできます。
+- `finalize()`: チャネル停止時 (Ctrl+C、または受信元デーモンとの切断) に一度だけ呼ばれます。エラーはログに出るだけで処理には影響しません (すでにシャットダウン中のため)。
+
+転送先チャネルの TX パイプは、実際に転送が発生した時点で遅延接続されます。対応するデーモンが起動していない転送先はフレームをドロップし、3秒ごとに再接続を試みます (他の転送先への配信には影響しません)。
+
+サンプルスクリプトは `examples/gateway_example.lua` にあります。
 
 ## 動作要件
 
