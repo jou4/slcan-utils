@@ -9,16 +9,21 @@
  * data, each time).
  *
  * Usage:
- *   slcan_generator.exe [channel] -g <ms> [-f] [-I <id>] [-L <len>] [-D <data>]
+ *   slcan_generator.exe [channel] [-g <ms>] [-f] [-e] [-I <id>] [-L <len>] [-D <data>]
  *   slcan_generator.exe -h | --help
  *
  * -g <ms>   Transmission period in milliseconds (default: 200).
  * -f        CAN FD mode. Omit for Classic CAN.
+ * -e        Force Extended (29-bit) ID. Without -I, randomizes the
+ *           per-frame ID from the Extended range instead of
+ *           Standard. With -I, overrides the digit-count-based
+ *           Standard/Extended guess below (never turns it off).
  * -I <id>   CAN ID in hex (e.g. 123 or 1A2B3C4D). 1-7 hex digits is
  *           Standard (11-bit); exactly 8 hex digits is Extended
  *           (29-bit) -- same convention slcan_parse_frame() uses for
- *           candump-style "ID#DATA" text. Omitted: a fresh random
- *           Standard (11-bit) ID every frame.
+ *           candump-style "ID#DATA" text (see also -e above).
+ *           Omitted: a fresh random ID every frame (Standard unless
+ *           -e is given).
  * -L <len>  Data length in bytes: 0-8 (Classic) or 0-64 (-f). If -D
  *           is also given they must agree; if -D is given without
  *           -L, the length is taken from -D's byte count. Omitted
@@ -81,7 +86,7 @@ static void print_usage(const char *prog)
     snprintf(pipe_tx_ex, sizeof(pipe_tx_ex), PIPE_TX_FORMAT, DEFAULT_CHANNEL);
 
     fprintf(stderr,
-        "Usage: %s [channel] [-g <ms>] [-f] [-I <id>] [-L <len>] [-D <data>]\n"
+        "Usage: %s [channel] [-g <ms>] [-f] [-e] [-I <id>] [-L <len>] [-D <data>]\n"
         "       %s -h | --help\n"
         "\n"
         "  channel   CAN channel name, must match the daemon's channel\n"
@@ -90,10 +95,12 @@ static void print_usage(const char *prog)
         "Options:\n"
         "  -g <ms>   Transmission period in milliseconds (default: %d)\n"
         "  -f        CAN FD mode (default: Classic CAN)\n"
+        "  -e        Force Extended (29-bit) ID (see -I below).\n"
         "  -I <id>   CAN ID in hex, e.g. 123 or 1A2B3C4D.\n"
         "            1-7 hex digits = Standard (11-bit); 8 hex digits =\n"
-        "            Extended (29-bit). Omit for a fresh random Standard\n"
-        "            ID every frame.\n"
+        "            Extended (29-bit); -e forces Extended either way.\n"
+        "            Omit for a fresh random ID every frame (Standard\n"
+        "            unless -e is given).\n"
         "  -L <len>  Data length in bytes: 0-8 (Classic) or 0-64 (-f).\n"
         "            Must agree with -D's byte count if both are given.\n"
         "            Omit (with no -D) for a fresh random length every\n"
@@ -124,13 +131,28 @@ static uint8_t hex2byte(const char *p)
     return (uint8_t)strtoul(hex, NULL, 16);
 }
 
-/* Parse an -I argument: a hex CAN ID string. Sets *id and *ext per
- * the digit-count convention used elsewhere in this project (exactly
- * 8 hex digits = Extended, otherwise Standard -- see
- * slcan_parse_frame() in slcan.c), and range-checks the result
- * against CAN_SFF_ID_MAX/CAN_EFF_ID_MAX. Returns 0 on success, -1 on
- * any parse/range error. */
-static int parse_hex_id(const char *s, uint32_t *id, uint8_t *ext)
+/* rand() alone only spans [0, RAND_MAX], which the C standard permits
+ * to be as low as 32767 -- and is exactly that on this MinGW/MSVC
+ * runtime -- nowhere near enough to cover the 29-bit Extended CAN ID
+ * range (~536M values) on its own; "rand() % wide_range" would then
+ * only ever produce values below RAND_MAX. Combine two calls into a
+ * wider value first. Not cryptographic quality, just enough entropy
+ * for traffic generation. */
+static uint32_t rand_u32(void)
+{
+    return ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+}
+
+/* Parse an -I argument: a hex CAN ID string. Sets *id and *ext_digits
+ * per the digit-count convention used elsewhere in this project
+ * (exactly 8 hex digits = Extended, otherwise Standard -- see
+ * slcan_parse_frame() in slcan.c). Does NOT range-check *id against
+ * CAN_SFF_ID_MAX/CAN_EFF_ID_MAX: the -e flag (parsed later, possibly
+ * appearing after -I on the command line) can still force Extended
+ * even for a short digit string, so the caller re-checks the range
+ * once the final Standard/Extended choice is known (see main()).
+ * Returns 0 on success, -1 if s isn't 1-8 hex digits. */
+static int parse_hex_id(const char *s, uint32_t *id, uint8_t *ext_digits)
 {
     size_t len = strlen(s);
     if (len == 0 || len > 8) return -1;
@@ -138,12 +160,8 @@ static int parse_hex_id(const char *s, uint32_t *id, uint8_t *ext)
         if (!isxdigit((unsigned char)s[i])) return -1;
     }
 
-    unsigned long v = strtoul(s, NULL, 16);
-    *ext = (len == 8) ? 1 : 0;
-    uint32_t max_id = *ext ? CAN_EFF_ID_MAX : CAN_SFF_ID_MAX;
-    if (v > max_id) return -1;
-
-    *id = (uint32_t)v;
+    *id         = (uint32_t)strtoul(s, NULL, 16);
+    *ext_digits = (len == 8) ? 1 : 0;
     return 0;
 }
 
@@ -197,11 +215,12 @@ int main(int argc, char *argv[])
     const char *ch          = DEFAULT_CHANNEL;
     BOOL        ch_set       = FALSE;
     BOOL        fd_mode      = FALSE;
+    BOOL        ext_mode     = FALSE;   /* -e: force Extended ID */
     DWORD       period_ms    = DEFAULT_PERIOD_MS;
 
     BOOL        have_id      = FALSE;
     uint32_t    fixed_id     = 0;
-    uint8_t     fixed_ext    = 0;
+    uint8_t     fixed_ext_digits = 0;   /* ext guessed from -I's digit count */
 
     BOOL        have_len     = FALSE;
     uint8_t     fixed_len    = 0;
@@ -233,16 +252,19 @@ int main(int argc, char *argv[])
         } else if (strcmp(arg, "-f") == 0) {
             fd_mode = TRUE;
 
+        } else if (strcmp(arg, "-e") == 0) {
+            ext_mode = TRUE;
+
         } else if (strcmp(arg, "-I") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "[generator] Error: -I requires a value\n\n");
                 print_usage(prog);
                 return 1;
             }
-            if (parse_hex_id(argv[i], &fixed_id, &fixed_ext) != 0) {
+            if (parse_hex_id(argv[i], &fixed_id, &fixed_ext_digits) != 0) {
                 fprintf(stderr,
                         "[generator] Error: invalid -I value '%s' "
-                        "(1-8 hex digits, in range)\n\n", argv[i]);
+                        "(1-8 hex digits)\n\n", argv[i]);
                 print_usage(prog);
                 return 1;
             }
@@ -297,6 +319,23 @@ int main(int argc, char *argv[])
         } else {
             fprintf(stderr, "[generator] Error: unrecognized argument '%s'\n\n",
                     arg);
+            print_usage(prog);
+            return 1;
+        }
+    }
+
+    /* Final Standard/Extended choice: -e always wins if given; -I's
+     * own digit count is only consulted when -e was not given (see
+     * parse_hex_id()'s comment above). Range-checked here, now that
+     * both -I and -e (which can appear in either order on the
+     * command line) have been fully parsed. */
+    uint8_t fixed_ext = ext_mode ? 1 : fixed_ext_digits;
+    if (have_id) {
+        uint32_t max_id = fixed_ext ? CAN_EFF_ID_MAX : CAN_SFF_ID_MAX;
+        if (fixed_id > max_id) {
+            fprintf(stderr,
+                    "[generator] Error: -I 0x%X exceeds the %s ID range\n\n",
+                    fixed_id, fixed_ext ? "Extended (29-bit)" : "Standard (11-bit)");
             print_usage(prog);
             return 1;
         }
@@ -357,9 +396,10 @@ int main(int argc, char *argv[])
     srand(GetTickCount() ^ GetCurrentProcessId());
 
     fprintf(stderr,
-            "[generator] Sending to channel '%s' every %lu ms (%s). "
+            "[generator] Sending to channel '%s' every %lu ms (%s%s). "
             "Press Ctrl+C to stop.\n",
-            ch, (unsigned long)period_ms, fd_mode ? "CAN FD" : "Classic CAN");
+            ch, (unsigned long)period_ms, fd_mode ? "CAN FD" : "Classic CAN",
+            ext_mode ? ", forced Extended" : "");
 
     DWORD    written;
     CanFrame frame;
@@ -375,8 +415,9 @@ int main(int argc, char *argv[])
             frame.id  = fixed_id;
             frame.ext = fixed_ext;
         } else {
-            frame.id  = (uint32_t)(rand() % (CAN_SFF_ID_MAX + 1));
-            frame.ext = 0;
+            uint32_t max_id = ext_mode ? CAN_EFF_ID_MAX : CAN_SFF_ID_MAX;
+            frame.id  = rand_u32() % (max_id + 1);
+            frame.ext = ext_mode ? 1 : 0;
         }
 
         uint8_t len;
