@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "slcan.h"
 
 
@@ -158,6 +159,31 @@ static HANDLE  g_hSerial  = INVALID_HANDLE_VALUE;
 static TxQueue g_txQueue;
 static volatile BOOL g_running = TRUE;
 static int     g_fd_mode  = 0;
+
+/* Channel name, set once in main() right after it's resolved from the
+ * command line, and read (never written) by every other thread from
+ * then on -- so no synchronization is needed for daemon_log() below
+ * to read it. Left at "-" for the handful of very early argument-
+ * parsing errors that can happen before a channel is known. */
+static const char *g_channel = "-";
+
+/* fprintf(stderr, ...) with "[<channel>] " automatically prepended,
+ * so that when several slcd.exe instances (e.g. one per --vcan
+ * channel, see start-vcan-multi.bat) are launched into the same
+ * console with `start /B` and their output interleaves, each line
+ * can still be told apart. Every existing "[daemon]"/"[rx]"/"[tx]"/
+ * "[tx_pipe]"/"[rx_pipe]" tag is left as-is right after the channel
+ * prefix, e.g. "[can0] [rx_pipe] reader connected". Drop-in
+ * replacement for fprintf(stderr, ...) -- same format-string/varargs
+ * usage, just without the FILE* argument. */
+static void daemon_log(const char *fmt, ...)
+{
+    va_list ap;
+    fprintf(stderr, "[%s] ", g_channel);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 
 /*
@@ -297,7 +323,7 @@ static void slcan_open(HANDLE h, int arb_code, int data_code)
 
 	// close existing session
     if (!serial_write_sync(h, "C\r", 2, &ov))
-        fprintf(stderr, "[daemon] WARNING: failed to send close command (C)\n");
+        daemon_log("[daemon] WARNING: failed to send close command (C)\n");
     Sleep(100);
 
     /* drain whatever the adapter sent back for the close above; the
@@ -310,7 +336,7 @@ static void slcan_open(HANDLE h, int arb_code, int data_code)
 
     snprintf(cmd, sizeof(cmd), "S%d\r", arb_code);
     if (!serial_write_sync(h, cmd, (DWORD)strlen(cmd), &ov))
-        fprintf(stderr,
+        daemon_log(
                 "[daemon] WARNING: failed to set arbitration rate (S%d)\n",
                 arb_code);
     Sleep(50);
@@ -318,23 +344,23 @@ static void slcan_open(HANDLE h, int arb_code, int data_code)
     if (data_code >= 0) {
         snprintf(cmd, sizeof(cmd), "Y%d\r", data_code);
         if (!serial_write_sync(h, cmd, (DWORD)strlen(cmd), &ov))
-            fprintf(stderr,
+            daemon_log(
                     "[daemon] WARNING: failed to set data rate (Y%d)\n",
                     data_code);
         Sleep(50);
         g_fd_mode = 1;
-        fprintf(stderr, "[daemon] CAN FD mode: arb=S%d data=Y%d\n",
+        daemon_log("[daemon] CAN FD mode: arb=S%d data=Y%d\n",
                 arb_code, data_code);
     } else {
-        fprintf(stderr, "[daemon] Classic CAN mode: S%d\n", arb_code);
+        daemon_log("[daemon] Classic CAN mode: S%d\n", arb_code);
     }
 
     if (!serial_write_sync(h, "O\r", 2, &ov))
-        fprintf(stderr, "[daemon] WARNING: failed to open SLCAN channel (O)\n");
+        daemon_log("[daemon] WARNING: failed to open SLCAN channel (O)\n");
     Sleep(100);
 
     CloseHandle(ov.hEvent);
-    fprintf(stderr, "[daemon] SLCAN channel opened\n");
+    daemon_log("[daemon] SLCAN channel opened\n");
 }
 
 /* Send the SLCAN "close channel" command ("C") during shutdown, best
@@ -345,9 +371,9 @@ static void slcan_close(HANDLE h)
     OVERLAPPED ov = {0};
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!serial_write_sync(h, "C\r", 2, &ov))
-        fprintf(stderr, "[daemon] WARNING: failed to send close command (C)\n");
+        daemon_log("[daemon] WARNING: failed to send close command (C)\n");
     CloseHandle(ov.hEvent);
-    fprintf(stderr, "[daemon] SLCAN channel closed\n");
+    daemon_log("[daemon] SLCAN channel closed\n");
 }
 
 
@@ -402,7 +428,7 @@ static DWORD WINAPI rx_thread(LPVOID arg)
         if (!ok) {
             DWORD err = GetLastError();
             if (err != ERROR_IO_PENDING) {
-                fprintf(stderr, "[rx] ReadFile error: %lu\n", err);
+                daemon_log("[rx] ReadFile error: %lu\n", err);
                 break;
             }
             DWORD wait = WaitForSingleObject(ov.hEvent, 200);
@@ -476,14 +502,14 @@ static DWORD WINAPI tx_thread(LPVOID arg)
 
 			// received FD frame not in FD mode
             if (frame.fd && !g_fd_mode) {
-                fprintf(stderr,
+                daemon_log(
                         "[tx] WARNING: FD frame dropped (not in FD mode)\n");
                 continue;
             }
 
             int len = slcan_encode(&frame, slcan_line, sizeof(slcan_line));
             if (len <= 0) {
-                fprintf(stderr, "[tx] encode error\n");
+                daemon_log("[tx] encode error\n");
                 continue;
             }
 
@@ -493,12 +519,12 @@ static DWORD WINAPI tx_thread(LPVOID arg)
             if (!ok) {
                 DWORD err = GetLastError();
                 if (err != ERROR_IO_PENDING) {
-                    fprintf(stderr, "[tx] WriteFile error: %lu\n", err);
+                    daemon_log("[tx] WriteFile error: %lu\n", err);
                     goto cleanup;
                 }
                 DWORD wait = WaitForSingleObject(ov.hEvent, 5000);
                 if (wait != WAIT_OBJECT_0) {
-                    fprintf(stderr, "[tx] timeout\n");
+                    daemon_log("[tx] timeout\n");
                     CancelIo(g_hSerial);
                     continue;
                 }
@@ -535,7 +561,7 @@ static DWORD WINAPI tx_client_worker(LPVOID arg)
 
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    fprintf(stderr, "[tx_pipe] writer connected\n");
+    daemon_log("[tx_pipe] writer connected\n");
 
     while (g_running) {
         ResetEvent(ov.hEvent);
@@ -559,7 +585,7 @@ static DWORD WINAPI tx_client_worker(LPVOID arg)
         txq_push(&g_txQueue, &frame);
     }
 
-    fprintf(stderr, "[tx_pipe] writer disconnected\n");
+    daemon_log("[tx_pipe] writer disconnected\n");
     CloseHandle(ov.hEvent);
     DisconnectNamedPipe(hPipe);
     CloseHandle(hPipe);
@@ -585,13 +611,13 @@ static DWORD WINAPI tx_pipe_listener(LPVOID arg)
             0, sizeof(CanFrame) * 16, 0, NULL);
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "[tx_pipe] CreateNamedPipe error: %lu\n",
+            daemon_log("[tx_pipe] CreateNamedPipe error: %lu\n",
                     GetLastError());
             Sleep(500);
             continue;
         }
 
-        //fprintf(stderr, "[tx_pipe] waiting for writer...\n");
+        //daemon_log("[tx_pipe] waiting for writer...\n");
 
         OVERLAPPED covl = {0};
         covl.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -617,7 +643,7 @@ static DWORD WINAPI tx_pipe_listener(LPVOID arg)
 
         if (!connected) {
             if (g_running)
-                fprintf(stderr, "[tx_pipe] ConnectNamedPipe error: %lu\n",
+                daemon_log("[tx_pipe] ConnectNamedPipe error: %lu\n",
                         GetLastError());
             CloseHandle(hPipe);
             continue;
@@ -631,7 +657,7 @@ static DWORD WINAPI tx_pipe_listener(LPVOID arg)
         if (hThread) {
             CloseHandle(hThread);
         } else {
-            fprintf(stderr, "[tx_pipe] CreateThread error: %lu\n",
+            daemon_log("[tx_pipe] CreateThread error: %lu\n",
                     GetLastError());
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
@@ -664,7 +690,7 @@ static DWORD WINAPI rx_client_worker(LPVOID arg)
 
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    fprintf(stderr, "[rx_pipe] reader connected\n");
+    daemon_log("[rx_pipe] reader connected\n");
 
     while (g_running) {
         WaitForSingleObject(client.ring.event, 100);
@@ -688,7 +714,7 @@ static DWORD WINAPI rx_client_worker(LPVOID arg)
     }
 
 reader_disconnected:
-    fprintf(stderr, "[rx_pipe] reader disconnected\n");
+    daemon_log("[rx_pipe] reader disconnected\n");
     client.active = FALSE;
     rx_client_remove(&client);
 
@@ -717,13 +743,13 @@ static DWORD WINAPI rx_pipe_listener(LPVOID arg)
             sizeof(CanFrame) * 16, 0, 0, NULL);
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "[rx_pipe] CreateNamedPipe error: %lu\n",
+            daemon_log("[rx_pipe] CreateNamedPipe error: %lu\n",
                     GetLastError());
             Sleep(500);
             continue;
         }
 
-        //fprintf(stderr, "[rx_pipe] waiting for reader...\n");
+        //daemon_log("[rx_pipe] waiting for reader...\n");
 
         OVERLAPPED covl = {0};
         covl.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -749,7 +775,7 @@ static DWORD WINAPI rx_pipe_listener(LPVOID arg)
 
         if (!connected) {
             if (g_running)
-                fprintf(stderr, "[rx_pipe] ConnectNamedPipe error: %lu\n",
+                daemon_log("[rx_pipe] ConnectNamedPipe error: %lu\n",
                         GetLastError());
             CloseHandle(hPipe);
             continue;
@@ -763,7 +789,7 @@ static DWORD WINAPI rx_pipe_listener(LPVOID arg)
         if (hThread) {
             CloseHandle(hThread);
         } else {
-            fprintf(stderr, "[rx_pipe] CreateThread error: %lu\n",
+            daemon_log("[rx_pipe] CreateThread error: %lu\n",
                     GetLastError());
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
@@ -925,7 +951,7 @@ int main(int argc, char *argv[])
         vcan_mode = TRUE;
 
         if (argc > 3) {
-            fprintf(stderr,
+            daemon_log(
                     "[daemon] Error: --vcan takes at most one argument "
                     "(channel); arb_code/data_code do not apply\n\n");
             print_usage(prog);
@@ -933,7 +959,7 @@ int main(int argc, char *argv[])
         }
         if (argc == 3) {
             if (!is_valid_channel(argv[2])) {
-                fprintf(stderr,
+                daemon_log(
                         "[daemon] Error: invalid channel name '%s' "
                         "(use letters, digits, '_' or '-', non-empty)\n\n",
                         argv[2]);
@@ -945,21 +971,21 @@ int main(int argc, char *argv[])
 
     } else {
         if (argc > 5) {
-            fprintf(stderr, "[daemon] Error: too many arguments\n\n");
+            daemon_log("[daemon] Error: too many arguments\n\n");
             print_usage(prog);
             return 1;
         }
 
         if (argc >= 2) {
             if (argv[1][0] == '\0') {
-                fprintf(stderr, "[daemon] Error: empty COM port name\n\n");
+                daemon_log("[daemon] Error: empty COM port name\n\n");
                 print_usage(prog);
                 return 1;
             }
             if (argv[1][0] != '\\') {
                 int need = snprintf(portbuf, sizeof(portbuf), "\\\\.\\%s", argv[1]);
                 if (need < 0 || need >= (int)sizeof(portbuf)) {
-                    fprintf(stderr, "[daemon] Error: COM port name too long: %s\n",
+                    daemon_log("[daemon] Error: COM port name too long: %s\n",
                             argv[1]);
                     return 1;
                 }
@@ -971,7 +997,7 @@ int main(int argc, char *argv[])
 
         if (argc >= 3) {
             if (!is_valid_channel(argv[2])) {
-                fprintf(stderr,
+                daemon_log(
                         "[daemon] Error: invalid channel name '%s' "
                         "(use letters, digits, '_' or '-', non-empty)\n\n",
                         argv[2]);
@@ -982,7 +1008,7 @@ int main(int argc, char *argv[])
         }
 
         if (argc >= 4 && parse_int_range(argv[3], 0, 8, &arb_code) != 0) {
-            fprintf(stderr,
+            daemon_log(
                     "[daemon] Error: invalid arb_code '%s' (must be an integer 0-8)\n\n",
                     argv[3]);
             print_usage(prog);
@@ -990,7 +1016,7 @@ int main(int argc, char *argv[])
         }
 
         if (argc >= 5 && parse_data_code(argv[4], &data_code) != 0) {
-            fprintf(stderr,
+            daemon_log(
                     "[daemon] Error: invalid data_code '%s' (must be 1, 2, 4 or 5)\n\n",
                     argv[4]);
             print_usage(prog);
@@ -998,35 +1024,37 @@ int main(int argc, char *argv[])
         }
     }
 
+    g_channel = ch;   /* daemon_log() prefixes every message with this from here on */
+
 	char pipetxbuf[32], piperxbuf[32];
     int  need_tx = snprintf(pipetxbuf, sizeof(pipetxbuf), PIPE_TX_FORMAT, ch);
     int  need_rx = snprintf(piperxbuf, sizeof(piperxbuf), PIPE_RX_FORMAT, ch);
     if (need_tx < 0 || need_tx >= (int)sizeof(pipetxbuf) ||
         need_rx < 0 || need_rx >= (int)sizeof(piperxbuf)) {
-        fprintf(stderr, "[daemon] Error: channel name too long: %s\n", ch);
+        daemon_log("[daemon] Error: channel name too long: %s\n", ch);
         return 1;
     }
     g_pipe_tx = pipetxbuf;
     g_pipe_rx = piperxbuf;
 
     if (vcan_mode) {
-        fprintf(stderr,
+        daemon_log(
                 "[daemon] Virtual CAN channel '%s' (no physical adapter)\n", ch);
     } else {
         g_hSerial = open_serial(port);
         if (g_hSerial == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "[daemon] Cannot open %s: %lu\n",
+            daemon_log("[daemon] Cannot open %s: %lu\n",
                     port, GetLastError());
             return 1;
         }
-        fprintf(stderr, "[daemon] Opened %s as %s\n", port, ch);
+        daemon_log("[daemon] Opened %s as %s\n", port, ch);
     }
 
     txq_init(&g_txQueue);
 	g_rxClientsMutex = CreateMutex(NULL, FALSE, NULL);
 
     if (!SetConsoleCtrlHandler(console_ctrl_handler, TRUE))
-        fprintf(stderr,
+        daemon_log(
                 "[daemon] WARNING: could not install Ctrl+C handler (%lu); "
                 "Ctrl+C will terminate without cleanup\n", GetLastError());
 
@@ -1044,7 +1072,7 @@ int main(int argc, char *argv[])
     threads[nthreads++] = CreateThread(NULL, 0, tx_pipe_listener, NULL, 0, NULL);
     threads[nthreads++] = CreateThread(NULL, 0, rx_pipe_listener, NULL, 0, NULL);
 
-    fprintf(stderr, "[daemon] Running. Press Ctrl+C to stop.\n");
+    daemon_log("[daemon] Running. Press Ctrl+C to stop.\n");
     WaitForMultipleObjects((DWORD)nthreads, threads, TRUE, INFINITE);
 
     g_running = FALSE;
