@@ -107,7 +107,12 @@ add_executable(slcgw
 )
 target_link_libraries(slcgw PRIVATE slcan lua)
 
-install(TARGETS slcd slcw slcr slcplay slcgw
+add_executable(slcgen
+    src/slcan_generator.c
+)
+target_link_libraries(slcgen PRIVATE slcan)
+
+install(TARGETS slcd slcw slcr slcplay slcgw slcgen
     RUNTIME DESTINATION bin
 )
 
@@ -115,6 +120,6 @@ message(STATUS "--------------------------------------------")
 message(STATUS "Project : ${PROJECT_NAME} ${PROJECT_VERSION}")
 message(STATUS "Compiler: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
 message(STATUS "Build   : ${CMAKE_BUILD_TYPE}")
-message(STATUS "Targets : serial_daemon  serial_writer  serial_reader  slcan_player  slcan_gateway")
+message(STATUS "Targets : serial_daemon  serial_writer  serial_reader  slcan_player  slcan_gateway  slcan_generator")
 message(STATUS "--------------------------------------------")
 
