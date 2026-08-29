@@ -351,6 +351,31 @@ static void slcan_close(HANDLE h)
 }
 
 
+/* Virtual CAN loopback pump (--vcan mode, no physical adapter).
+ * Drains g_txQueue -- fed by every connected serial_writer.c via
+ * tx_client_worker, exactly as in physical mode -- and hands each
+ * frame straight to rx_broadcast() so every connected reader sees
+ * whatever was written, unmodified. Unlike tx_thread/rx_thread there
+ * is no SLCAN text encode/decode round trip (so no FD data-length
+ * quantization to SLCAN's fixed length codes) and no g_fd_mode gate
+ * (a virtual channel has no negotiated bitrate, so Classic and FD
+ * frames are both accepted unconditionally). Runs until g_running is
+ * cleared. */
+static DWORD WINAPI vcan_loop_thread(LPVOID arg)
+{
+    (void)arg;
+    CanFrame frame;
+
+    while (g_running) {
+        WaitForSingleObject(g_txQueue.event, 200);
+        while (txq_pop(&g_txQueue, &frame)) {
+            rx_broadcast(&frame);
+        }
+    }
+    return 0;
+}
+
+
 /* Serial -> reader(s) pump. Overlapped-reads raw bytes off g_hSerial,
  * splits them into '\r'-terminated SLCAN lines (LF is ignored, an
  * empty line or a lone BEL '\a' - the adapter's error indicator -
@@ -804,6 +829,7 @@ static void print_usage(const char *prog)
 
     fprintf(stderr,
         "Usage: %s [COM] [channel] [arb_code] [data_code]\n"
+        "       %s --vcan [channel]\n"
         "       %s -h | --help\n"
         "\n"
         "Arguments (all optional, positional):\n"
@@ -821,6 +847,13 @@ static void print_usage(const char *prog)
         "FD Data Rate Code (Yn / CANable 2.0):\n"
         "  1=1M  2=2M  4=4M  5=5M\n"
         "\n"
+        "--vcan (virtual CAN, no physical adapter):\n"
+        "  Runs channel with no serial port at all. Whatever a writer\n"
+        "  sends is handed straight to every connected reader (no SLCAN\n"
+        "  encode/decode, no bitrate). arb_code/data_code do not apply\n"
+        "  and are rejected if given. Useful for testing slcr/slcw/\n"
+        "  slcplay/slcgw without a physical USB-CAN adapter.\n"
+        "\n"
         "Named Pipe (per channel, e.g. channel=%s):\n"
         "  %s   writer CLI -> daemon\n"
         "  %s   daemon -> reader CLI\n"
@@ -829,12 +862,15 @@ static void print_usage(const char *prog)
         "  %s COM1 can0 6 5   CAN FD  (Arbitration 500kbps, Data 1Mbps)\n"
         "  %s COM1 can0 6     Classic CAN 500kbps\n"
         "  %s                 Use defaults (%s, %s, code %d, Classic CAN)\n"
+        "  %s --vcan can0     Virtual CAN channel 'can0', no adapter\n"
+        "  %s --vcan          Virtual CAN channel, default channel (%s)\n"
         "\n"
         "Options:\n"
         "  -h, --help      Show this help message and exit\n",
-        prog, prog, DEFAULT_COM, DEFAULT_CHANNEL, DEFAULT_ARB_CODE,
+        prog, prog, prog, DEFAULT_COM, DEFAULT_CHANNEL, DEFAULT_ARB_CODE,
         DEFAULT_CHANNEL, pipe_tx_ex, pipe_rx_ex,
-        prog, prog, prog, DEFAULT_COM, DEFAULT_CHANNEL, DEFAULT_ARB_CODE);
+        prog, prog, prog, DEFAULT_COM, DEFAULT_CHANNEL, DEFAULT_ARB_CODE,
+        prog, prog, DEFAULT_CHANNEL);
 }
 
 /* Console control handler: on Ctrl+C, Ctrl+Break, or the console
@@ -877,12 +913,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (argc > 5) {
-        fprintf(stderr, "[daemon] Error: too many arguments\n\n");
-        print_usage(prog);
-        return 1;
-    }
-
+    BOOL        vcan_mode  = FALSE;
     const char *port      = DEFAULT_COM;
     const char *ch        = DEFAULT_CHANNEL;
     int         arb_code  = DEFAULT_ARB_CODE;
@@ -890,51 +921,81 @@ int main(int argc, char *argv[])
 
     char portbuf[16];
 
-    if (argc >= 2) {
-        if (argv[1][0] == '\0') {
-            fprintf(stderr, "[daemon] Error: empty COM port name\n\n");
+    if (argc >= 2 && strcmp(argv[1], "--vcan") == 0) {
+        vcan_mode = TRUE;
+
+        if (argc > 3) {
+            fprintf(stderr,
+                    "[daemon] Error: --vcan takes at most one argument "
+                    "(channel); arb_code/data_code do not apply\n\n");
             print_usage(prog);
             return 1;
         }
-        if (argv[1][0] != '\\') {
-            int need = snprintf(portbuf, sizeof(portbuf), "\\\\.\\%s", argv[1]);
-            if (need < 0 || need >= (int)sizeof(portbuf)) {
-                fprintf(stderr, "[daemon] Error: COM port name too long: %s\n",
-                        argv[1]);
+        if (argc == 3) {
+            if (!is_valid_channel(argv[2])) {
+                fprintf(stderr,
+                        "[daemon] Error: invalid channel name '%s' "
+                        "(use letters, digits, '_' or '-', non-empty)\n\n",
+                        argv[2]);
+                print_usage(prog);
                 return 1;
             }
-            port = portbuf;
-        } else {
-            port = argv[1];
+            ch = argv[2];
         }
-    }
 
-	if (argc >= 3) {
-        if (!is_valid_channel(argv[2])) {
-            fprintf(stderr,
-                    "[daemon] Error: invalid channel name '%s' "
-                    "(use letters, digits, '_' or '-', non-empty)\n\n",
-                    argv[2]);
+    } else {
+        if (argc > 5) {
+            fprintf(stderr, "[daemon] Error: too many arguments\n\n");
             print_usage(prog);
             return 1;
         }
-		ch = argv[2];
-	}
 
-    if (argc >= 4 && parse_int_range(argv[3], 0, 8, &arb_code) != 0) {
-        fprintf(stderr,
-                "[daemon] Error: invalid arb_code '%s' (must be an integer 0-8)\n\n",
-                argv[3]);
-        print_usage(prog);
-        return 1;
-    }
+        if (argc >= 2) {
+            if (argv[1][0] == '\0') {
+                fprintf(stderr, "[daemon] Error: empty COM port name\n\n");
+                print_usage(prog);
+                return 1;
+            }
+            if (argv[1][0] != '\\') {
+                int need = snprintf(portbuf, sizeof(portbuf), "\\\\.\\%s", argv[1]);
+                if (need < 0 || need >= (int)sizeof(portbuf)) {
+                    fprintf(stderr, "[daemon] Error: COM port name too long: %s\n",
+                            argv[1]);
+                    return 1;
+                }
+                port = portbuf;
+            } else {
+                port = argv[1];
+            }
+        }
 
-    if (argc >= 5 && parse_data_code(argv[4], &data_code) != 0) {
-        fprintf(stderr,
-                "[daemon] Error: invalid data_code '%s' (must be 1, 2, 4 or 5)\n\n",
-                argv[4]);
-        print_usage(prog);
-        return 1;
+        if (argc >= 3) {
+            if (!is_valid_channel(argv[2])) {
+                fprintf(stderr,
+                        "[daemon] Error: invalid channel name '%s' "
+                        "(use letters, digits, '_' or '-', non-empty)\n\n",
+                        argv[2]);
+                print_usage(prog);
+                return 1;
+            }
+            ch = argv[2];
+        }
+
+        if (argc >= 4 && parse_int_range(argv[3], 0, 8, &arb_code) != 0) {
+            fprintf(stderr,
+                    "[daemon] Error: invalid arb_code '%s' (must be an integer 0-8)\n\n",
+                    argv[3]);
+            print_usage(prog);
+            return 1;
+        }
+
+        if (argc >= 5 && parse_data_code(argv[4], &data_code) != 0) {
+            fprintf(stderr,
+                    "[daemon] Error: invalid data_code '%s' (must be 1, 2, 4 or 5)\n\n",
+                    argv[4]);
+            print_usage(prog);
+            return 1;
+        }
     }
 
 	char pipetxbuf[32], piperxbuf[32];
@@ -948,13 +1009,18 @@ int main(int argc, char *argv[])
     g_pipe_tx = pipetxbuf;
     g_pipe_rx = piperxbuf;
 
-    g_hSerial = open_serial(port);
-    if (g_hSerial == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "[daemon] Cannot open %s: %lu\n",
-                port, GetLastError());
-        return 1;
+    if (vcan_mode) {
+        fprintf(stderr,
+                "[daemon] Virtual CAN channel '%s' (no physical adapter)\n", ch);
+    } else {
+        g_hSerial = open_serial(port);
+        if (g_hSerial == INVALID_HANDLE_VALUE) {
+            fprintf(stderr, "[daemon] Cannot open %s: %lu\n",
+                    port, GetLastError());
+            return 1;
+        }
+        fprintf(stderr, "[daemon] Opened %s as %s\n", port, ch);
     }
-    fprintf(stderr, "[daemon] Opened %s as %s\n", port, ch);
 
     txq_init(&g_txQueue);
 	g_rxClientsMutex = CreateMutex(NULL, FALSE, NULL);
@@ -964,20 +1030,28 @@ int main(int argc, char *argv[])
                 "[daemon] WARNING: could not install Ctrl+C handler (%lu); "
                 "Ctrl+C will terminate without cleanup\n", GetLastError());
 
-    slcan_open(g_hSerial, arb_code, data_code);
+    if (!vcan_mode)
+        slcan_open(g_hSerial, arb_code, data_code);
 
     HANDLE threads[4];
-    threads[0] = CreateThread(NULL, 0, rx_thread,      NULL, 0, NULL);
-    threads[1] = CreateThread(NULL, 0, tx_thread,      NULL, 0, NULL);
-    threads[2] = CreateThread(NULL, 0, tx_pipe_listener, NULL, 0, NULL);
-    threads[3] = CreateThread(NULL, 0, rx_pipe_listener, NULL, 0, NULL);
+    int    nthreads = 0;
+    if (vcan_mode) {
+        threads[nthreads++] = CreateThread(NULL, 0, vcan_loop_thread, NULL, 0, NULL);
+    } else {
+        threads[nthreads++] = CreateThread(NULL, 0, rx_thread, NULL, 0, NULL);
+        threads[nthreads++] = CreateThread(NULL, 0, tx_thread, NULL, 0, NULL);
+    }
+    threads[nthreads++] = CreateThread(NULL, 0, tx_pipe_listener, NULL, 0, NULL);
+    threads[nthreads++] = CreateThread(NULL, 0, rx_pipe_listener, NULL, 0, NULL);
 
     fprintf(stderr, "[daemon] Running. Press Ctrl+C to stop.\n");
-    WaitForMultipleObjects(4, threads, TRUE, INFINITE);
+    WaitForMultipleObjects((DWORD)nthreads, threads, TRUE, INFINITE);
 
     g_running = FALSE;
-    slcan_close(g_hSerial);
-    CloseHandle(g_hSerial);
+    if (!vcan_mode) {
+        slcan_close(g_hSerial);
+        CloseHandle(g_hSerial);
+    }
 	CloseHandle(g_rxClientsMutex);
     return 0;
 }

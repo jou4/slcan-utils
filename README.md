@@ -6,7 +6,7 @@ Windows 用の SLCAN (Lawicel/CANable プロトコル) ユーティリティで�
 
 | 実行ファイル | 役割 |
 | --- | --- |
-| `slcd.exe` (`serial_daemon.c`) | COM ポートと SLCAN アダプタを開き、名前付きパイプ (`\\.\pipe\serial_tx\<channel>` / `\\.\pipe\serial_rx\<channel>`) を公開する常駐デーモン。複数の reader/writer から同時接続可能。 |
+| `slcd.exe` (`serial_daemon.c`) | COM ポートと SLCAN アダプタを開き、名前付きパイプ (`\\.\pipe\serial_tx\<channel>` / `\\.\pipe\serial_rx\<channel>`) を公開する常駐デーモン。複数の reader/writer から同時接続可能。`--vcan` 指定時は物理アダプタなしで動作する仮想 CAN チャネルになる。 |
 | `slcr.exe` (`serial_reader.c`) | デーモンの RX パイプに接続し、受信した CAN/CAN FD フレームを candump ライクなテキスト形式で標準出力に表示する CLI。 |
 | `slcw.exe` (`serial_writer.c`) | 標準入力からフレームのテキスト行を読み取り、デーモンの TX パイプ経由で送信する CLI。 |
 | `slcplay.exe` (`slcan_player.c`) | `slcr.exe` の出力形式のログファイルを、元のフレーム間隔を再現しながらデーモンの TX パイプへ再生する CLI。 |
@@ -47,6 +47,25 @@ slcd.exe                   すべて既定値 (COM1, can0, 500kbps, Classic CAN)
 
 - `arb_code` (調停レート): `0`=10k `1`=20k `2`=50k `3`=100k `4`=125k `5`=250k `6`=500k `7`=800k `8`=1M
 - `data_code` (CAN FD データレート、CANable 2.0 系): `1`=1M `2`=2M `4`=4M `5`=5M。省略時は Classic CAN。
+
+### 仮想 CAN チャネル (vcan)
+
+物理の USB-CAN アダプタを持っていなくても、`--vcan` を指定すると仮想チャネルとして `slcd.exe` を起動できます。
+
+```
+slcd.exe --vcan [channel]
+```
+
+```
+slcd.exe --vcan can0      仮想チャネル can0 (アダプタ不要)
+slcd.exe --vcan           既定チャネル (can0) の仮想チャネル
+```
+
+COM ポートを一切開かず、`slcw.exe` (または `slcplay.exe`/`slcgw.exe` からの転送) でそのチャネルの TX パイプに書き込まれたフレームを、SLCAN のエンコード/デコードを介さずそのまま RX パイプへ流します。つまり、あるチャネルに書き込んだフレームが、同じチャネルを見ている reader (`slcr.exe`、`slcgw.exe` など) にそのまま届く、単純なループバックです。`arb_code`/`data_code` は仮想チャネルには意味を持たないため指定できません (指定するとエラーになります)。
+
+`slcr.exe`/`slcw.exe`/`slcplay.exe`/`slcgw.exe` 側は通常の (物理アダプタの) チャネルと全く同じように扱えるので、実機なしでのゲートウェイスクリプトの動作確認や、reader/writer/player の疎通確認などに使えます。
+
+物理モードの `slcd.exe` と同じチャネル名で同時に `--vcan` を起動すると、名前付きパイプが競合し、reader/writer がどちらのデーモンに繋がるか不定になります。併用する場合はチャネル名を分けてください。
 
 ### フレームの受信 (reader)
 
@@ -134,4 +153,4 @@ slcgw.exe can0=examples/gateway_example.lua can1=other.lua
 
 ## 動作要件
 
-Windows 専用です (名前付きパイプ / Win32 API に依存しているため)。SLCAN プロトコルに対応した COM ポート接続の CAN/CAN FD アダプタ (Lawicel CANUSB, CANable など) が別途必要です。
+Windows 専用です (名前付きパイプ / Win32 API に依存しているため)。SLCAN プロトコルに対応した COM ポート接続の CAN/CAN FD アダプタ (Lawicel CANUSB, CANable など) が別途必要です (ただし `slcd.exe --vcan` を使う場合はアダプタ不要)。
